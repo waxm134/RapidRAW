@@ -80,6 +80,7 @@ ndk-context = "0.1"
 jni = "0.21"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls-webpki-roots"] }
 include_dir = "0.7.3"
+ort = { version = "2.0.0-rc.10", features = ["nnapi"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18.2"
