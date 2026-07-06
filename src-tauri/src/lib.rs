@@ -256,7 +256,23 @@ pub fn get_cached_full_warped_image(
     if is_raw {
         apply_cpu_default_raw_processing(&mut full_image);
     }
-    let warped_image = apply_geometry_warp(Cow::Borrowed(&full_image), js_adjustments).into_owned();
+
+    let warped_image = if let Some(context) = state.gpu_context.lock().unwrap().as_ref() {
+        let gpu_guard = state.gpu_processor.lock().unwrap();
+        if let Some(gpu_state) = gpu_guard.as_ref() {
+            let (img, _) = apply_all_transformations_with_gpu(
+                Cow::Borrowed(&full_image),
+                js_adjustments,
+                context,
+                &gpu_state.processor,
+            );
+            img.into_owned()
+        } else {
+            apply_geometry_warp(Cow::Borrowed(&full_image), js_adjustments).into_owned()
+        }
+    } else {
+        apply_geometry_warp(Cow::Borrowed(&full_image), js_adjustments).into_owned()
+    };
     let warped_arc = Arc::new(warped_image);
 
     {
@@ -739,7 +755,24 @@ fn generate_uncropped_preview(
             Cow::Borrowed(loaded_image.image.as_ref())
         };
 
-        let warped_image = apply_geometry_warp(patched_image, &adjustments_clone);
+        let warped_image = {
+            let gpu_guard = state.gpu_processor.lock().unwrap();
+            if let Some(gpu_state) = gpu_guard.as_ref() {
+                let img_ref = patched_image.as_ref();
+                let params: crate::image_processing::GeometryParams =
+                    serde_json::from_value(adjustments_clone.clone()).unwrap_or_default();
+                match crate::gpu_processing::gpu_warp_image_geometry(img_ref, &params, &context, &gpu_state.processor) {
+                    Ok(w) => Cow::Owned(w),
+                    Err(e) => {
+                        log::warn!("GPU warp failed ({}), falling back to CPU", e);
+                        apply_geometry_warp(patched_image, &adjustments_clone)
+                    }
+                }
+            } else {
+                drop(gpu_guard);
+                apply_geometry_warp(patched_image, &adjustments_clone)
+            }
+        };
 
         let orientation_steps = adjustments_clone["orientationSteps"].as_u64().unwrap_or(0) as u8;
         let coarse_rotated_image = apply_coarse_rotation(warped_image, orientation_steps);
@@ -1547,8 +1580,20 @@ fn generate_preview_for_path(
         }
     };
 
-    let (transformed_image, unscaled_crop_offset) =
-        apply_all_transformations(Cow::Borrowed(&base_image), &js_adjustments);
+    let (transformed_image, unscaled_crop_offset) = {
+        let gpu_guard = state.gpu_processor.lock().unwrap();
+        if let Some(gpu_state) = gpu_guard.as_ref() {
+            apply_all_transformations_with_gpu(
+                Cow::Borrowed(&base_image),
+                &js_adjustments,
+                &context,
+                &gpu_state.processor,
+            )
+        } else {
+            drop(gpu_guard);
+            apply_all_transformations(Cow::Borrowed(&base_image), &js_adjustments)
+        }
+    };
     let (img_w, img_h) = transformed_image.dimensions();
     let mask_definitions: Vec<MaskDefinition> = js_adjustments
         .get("masks")

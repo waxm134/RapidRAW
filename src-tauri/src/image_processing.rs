@@ -405,7 +405,7 @@ fn interpolate_pixel(
     }
 }
 
-fn build_transform_matrices(
+pub(crate) fn build_transform_matrices(
     params: &GeometryParams,
     width: f32,
     height: f32,
@@ -554,7 +554,7 @@ fn solve_generic_distortion_inv(r_target: f64, k_scaled: f64) -> f64 {
     r
 }
 
-fn compute_lens_auto_crop_scale(params: &GeometryParams, width: f32, height: f32) -> f64 {
+pub(crate) fn compute_lens_auto_crop_scale(params: &GeometryParams, width: f32, height: f32) -> f64 {
     let cx = (width / 2.0) as f64;
     let cy = (height / 2.0) as f64;
     let half_diagonal = (cx * cx + cy * cy).sqrt();

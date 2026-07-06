@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -9,7 +10,12 @@ use std::num::NonZero;
 use tauri::Manager;
 use wgpu::util::{DeviceExt, TextureDataOrder};
 
-use crate::image_processing::{AllAdjustments, GpuContext, MAX_MASKS};
+use nalgebra::Matrix3 as NaMatrix3;
+
+use crate::image_processing::{
+    AllAdjustments, GeometryParams, GpuContext, MAX_MASKS, build_transform_matrices,
+    compute_lens_auto_crop_scale, is_geometry_identity,
+};
 use crate::lut_processing::Lut;
 use crate::{AppState, GpuImageCache};
 
@@ -512,6 +518,39 @@ struct FlareParams {
     _pad: f32,
 }
 
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct GeometryUniforms {
+    inv_m00: f32,
+    inv_m01: f32,
+    inv_m02: f32,
+    inv_m10: f32,
+    inv_m11: f32,
+    inv_m12: f32,
+    inv_m20: f32,
+    inv_m21: f32,
+    inv_m22: f32,
+    cx: f32,
+    cy: f32,
+    half_diagonal: f32,
+    max_radius_sq_inv: f32,
+    auto_crop_scale: f32,
+    k_distortion: f32,
+    lk1: f32,
+    lk2: f32,
+    lk3: f32,
+    lens_dist_amt: f32,
+    tca_vr: f32,
+    tca_vb: f32,
+    lens_model: u32,
+    has_lens_correction: u32,
+    has_tca: u32,
+    src_width: u32,
+    src_height: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
 pub struct GpuProcessor {
     context: GpuContext,
     blur_bgl: wgpu::BindGroupLayout,
@@ -540,6 +579,10 @@ pub struct GpuProcessor {
     tonal_blur_view: wgpu::TextureView,
     clarity_blur_view: wgpu::TextureView,
     structure_blur_view: wgpu::TextureView,
+
+    geometry_bgl: wgpu::BindGroupLayout,
+    geometry_pipeline: wgpu::ComputePipeline,
+    geometry_params_buffer: wgpu::Buffer,
 
     pub tile_output_texture: wgpu::Texture,
     pub tile_output_texture_view: wgpu::TextureView,
@@ -624,6 +667,71 @@ impl GpuProcessor {
         let blur_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Blur Params Buffer"),
             size: std::mem::size_of::<BlurParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let geometry_shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Geometry Warp Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/geometry.wgsl").into()),
+        });
+
+        let geometry_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Geometry Warp BGL"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let geometry_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Geometry Warp Pipeline Layout"),
+                bind_group_layouts: &[Some(&geometry_bgl)],
+                immediate_size: 0,
+            });
+
+        let geometry_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Geometry Warp Pipeline"),
+                layout: Some(&geometry_pipeline_layout),
+                module: &geometry_shader_module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        let geometry_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Geometry Params Buffer"),
+            size: std::mem::size_of::<GeometryUniforms>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1064,6 +1172,9 @@ impl GpuProcessor {
             tonal_blur_view,
             clarity_blur_view,
             structure_blur_view,
+            geometry_bgl,
+            geometry_pipeline,
+            geometry_params_buffer,
             tile_output_texture,
             tile_output_texture_view,
             working_texture,
@@ -1645,6 +1756,23 @@ fn process_and_get_dynamic_image_inner(
         return Ok(base_image.clone());
     }
 
+    const MAX_GPU_PREVIEW_DIM: u32 = 2560;
+    let processing_image: Cow<'_, DynamicImage> = if width > MAX_GPU_PREVIEW_DIM
+        || height > MAX_GPU_PREVIEW_DIM
+    {
+        let scale = MAX_GPU_PREVIEW_DIM as f32 / width.max(height) as f32;
+        let new_w = (width as f32 * scale) as u32;
+        let new_h = (height as f32 * scale) as u32;
+        Cow::Owned(crate::image_processing::downscale_f32_image(
+            base_image,
+            new_w,
+            new_h,
+        ))
+    } else {
+        Cow::Borrowed(base_image)
+    };
+    let (width, height) = processing_image.dimensions();
+
     let mut old_processor = None;
     let mut reallocated = false;
 
@@ -1745,7 +1873,7 @@ fn process_and_get_dynamic_image_inner(
     }
 
     if cache_lock.is_none() {
-        let img_rgba_f16 = to_rgba_f16(base_image);
+        let img_rgba_f16 = to_rgba_f16(processing_image.as_ref());
         let texture_size = wgpu::Extent3d {
             width,
             height,
@@ -2016,4 +2144,236 @@ fn process_and_get_dynamic_image_inner(
     let img_buf = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(out_w, out_h, processed_pixels)
         .ok_or("Failed to create image buffer from GPU data")?;
     Ok(DynamicImage::ImageRgba8(img_buf))
+}
+
+pub fn gpu_warp_image_geometry(
+    image: &DynamicImage,
+    params: &GeometryParams,
+    context: &GpuContext,
+    processor: &GpuProcessor,
+) -> Result<DynamicImage, String> {
+    if is_geometry_identity(params) {
+        return Ok(DynamicImage::ImageRgb32F(image.to_rgb32f()));
+    }
+
+    let (width, height) = image.dimensions();
+    let device = &context.device;
+    let queue = &context.queue;
+
+    let (forward_transform, cx, cy, half_diagonal) =
+        build_transform_matrices(params, width as f32, height as f32);
+    let inv = forward_transform
+        .try_inverse()
+        .unwrap_or(NaMatrix3::identity());
+    let max_radius_sq = ((cx * cx + cy * cy) as f64).recip();
+    let half_diagonal_f = half_diagonal as f32;
+
+    let k_distortion = (params.distortion / 100.0) * 2.5;
+    let lk1 = params.lens_dist_k1;
+    let lk2 = params.lens_dist_k2;
+    let lk3 = params.lens_dist_k3;
+    let lens_dist_amt = (params.lens_distortion_amount) * 2.5;
+
+    let has_lens_correction = params.lens_distortion_enabled
+        && (lk1.abs() > 1e-6 || lk2.abs() > 1e-6 || lk3.abs() > 1e-6);
+
+    let auto_crop_scale = if has_lens_correction || k_distortion.abs() > 1e-5 {
+        compute_lens_auto_crop_scale(params, width as f32, height as f32) as f32
+    } else {
+        1.0
+    };
+
+    let vr = if (params.tca_vr - 1.0).abs() > 1e-5 {
+        params.tca_vr + (1.0 - params.tca_vr) * (1.0 - params.lens_tca_amount)
+    } else {
+        1.0
+    };
+    let vb = if (params.tca_vb - 1.0).abs() > 1e-5 {
+        params.tca_vb + (1.0 - params.tca_vb) * (1.0 - params.lens_tca_amount)
+    } else {
+        1.0
+    };
+    let has_tca = params.lens_tca_enabled && ((vr - 1.0).abs() > 1e-5 || (vb - 1.0).abs() > 1e-5);
+
+    let uniforms = GeometryUniforms {
+        inv_m00: inv[(0, 0)],
+        inv_m01: inv[(0, 1)],
+        inv_m02: inv[(0, 2)],
+        inv_m10: inv[(1, 0)],
+        inv_m11: inv[(1, 1)],
+        inv_m12: inv[(1, 2)],
+        inv_m20: inv[(2, 0)],
+        inv_m21: inv[(2, 1)],
+        inv_m22: inv[(2, 2)],
+        cx,
+        cy,
+        half_diagonal: half_diagonal_f,
+        max_radius_sq_inv: max_radius_sq as f32,
+        auto_crop_scale,
+        k_distortion,
+        lk1,
+        lk2,
+        lk3,
+        lens_dist_amt,
+        tca_vr: vr,
+        tca_vb: vb,
+        lens_model: params.lens_model,
+        has_lens_correction: has_lens_correction as u32,
+        has_tca: has_tca as u32,
+        src_width: width,
+        src_height: height,
+        _pad0: 0,
+        _pad1: 0,
+    };
+
+    let img_rgba_f16 = to_rgba_f16(image);
+    let texture_size = wgpu::Extent3d {
+        width,
+        height,
+        depth_or_array_layers: 1,
+    };
+
+    let input_texture = device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some("Geometry Warp Input"),
+            size: texture_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        },
+        TextureDataOrder::MipMajor,
+        bytemuck::cast_slice(&img_rgba_f16),
+    );
+    let input_view = input_texture.create_view(&Default::default());
+
+    let output_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Geometry Warp Output"),
+        size: texture_size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let output_view = output_texture.create_view(&Default::default());
+
+    queue.write_buffer(
+        &processor.geometry_params_buffer,
+        0,
+        bytemuck::bytes_of(&uniforms),
+    );
+
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Geometry Warp Bind Group"),
+        layout: &processor.geometry_bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&input_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&output_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: processor.geometry_params_buffer.as_entire_binding(),
+            },
+        ],
+    });
+
+    let workgroup_count_x = (width + 7) / 8;
+    let workgroup_count_y = (height + 7) / 8;
+
+    let mut encoder = device.create_command_encoder(&Default::default());
+    {
+        let mut cpass = encoder.begin_compute_pass(&Default::default());
+        cpass.set_pipeline(&processor.geometry_pipeline);
+        cpass.set_bind_group(0, &bind_group, &[]);
+        cpass.dispatch_workgroups(workgroup_count_x, workgroup_count_y, 1);
+    }
+
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let unpadded_bytes_per_row = width * 8;
+    let padded_bytes_per_row = (unpadded_bytes_per_row + align - 1) & !(align - 1);
+    let output_buffer_size = (padded_bytes_per_row * height) as u64;
+
+    let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Geometry Warp Readback Buffer"),
+        size: output_buffer_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &output_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &output_buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_bytes_per_row),
+                rows_per_image: Some(height),
+            },
+        },
+        texture_size,
+    );
+    queue.submit(Some(encoder.finish()));
+
+    let buffer_slice = output_buffer.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = tx.send(result);
+    });
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(std::time::Duration::from_secs(60)),
+        })
+        .map_err(|e| format!("GPU poll error during geometry warp: {}", e))?;
+    rx.recv()
+        .map_err(|e| format!("Failed receiving geometry warp map result: {}", e))?
+        .map_err(|e| e.to_string())?;
+
+    let padded_data = buffer_slice.get_mapped_range().to_vec();
+    output_buffer.unmap();
+
+    let data: Vec<u16> = if padded_bytes_per_row == unpadded_bytes_per_row {
+        bytemuck::cast_slice(&padded_data).to_vec()
+    } else {
+        let mut unpadded = Vec::with_capacity((unpadded_bytes_per_row * height) as usize);
+        for chunk in padded_data.chunks(padded_bytes_per_row as usize) {
+            unpadded.extend_from_slice(
+                bytemuck::cast_slice::<_, u16>(&chunk[..unpadded_bytes_per_row as usize]),
+            );
+        }
+        unpadded
+    };
+
+    let f16_pixels: Vec<f16> = data.into_iter().map(f16::from_bits).collect();
+
+    let mut rgb32f_data =
+        vec![0.0f32; (width * height * 3) as usize];
+    for y in 0..height {
+        for x in 0..width {
+            let src_idx = ((y * width + x) * 4) as usize;
+            let dst_idx = ((y * width + x) * 3) as usize;
+            rgb32f_data[dst_idx] = f16_pixels[src_idx].to_f32();
+            rgb32f_data[dst_idx + 1] = f16_pixels[src_idx + 1].to_f32();
+            rgb32f_data[dst_idx + 2] = f16_pixels[src_idx + 2].to_f32();
+        }
+    }
+
+    let out_img = ImageBuffer::<image::Rgb<f32>, Vec<f32>>::from_raw(width, height, rgb32f_data)
+        .ok_or("Failed to create warped image buffer")?;
+    Ok(DynamicImage::ImageRgb32F(out_img))
 }
