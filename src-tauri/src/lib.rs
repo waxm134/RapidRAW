@@ -895,11 +895,25 @@ async fn generate_uncropped_preview(
         .clone()
         .ok_or("No original image loaded")?;
 
+    let my_seq = state.uncropped_preview_seq.fetch_add(1, Ordering::SeqCst) + 1;
+
     tokio::task::spawn_blocking(move || {
         let state = app_handle.state::<AppState>();
         let path = loaded_image.path.clone();
         let is_raw = loaded_image.is_raw;
         let visual_hash = calculate_visual_hash(&path, &adjustments_clone);
+
+        if state.processing_active.load(Ordering::SeqCst) {
+            return Err("Superseded by active preview render".to_string());
+        }
+
+        let _guard = state
+            .uncropped_preview_work_mutex
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if state.uncropped_preview_seq.load(Ordering::SeqCst) != my_seq {
+            return Err("Superseded by newer uncropped preview request".to_string());
+        }
 
         let pre_geometry_base = {
             let mut cache = state.geometry_cache.lock().unwrap();
@@ -910,20 +924,46 @@ async fn generate_uncropped_preview(
                     .get("aiPatches")
                     .and_then(|v| v.as_array())
                     .is_some_and(|a| !a.is_empty());
-                let patched_image = if has_patches {
-                    Cow::Owned(
+
+                let settings = load_settings(app_handle.clone()).unwrap_or_default();
+                let target_dim = (settings.editor_preview_resolution.unwrap_or(1920) as f32) as u32;
+
+                let (orig_w, orig_h) = loaded_image.image.dimensions();
+                let oversized = orig_w > target_dim || orig_h > target_dim;
+
+                // On Android, start from the preview cache so the blur pass runs at
+                // preview resolution instead of allocating full-resolution buffers
+                let cached_preview_base = if cfg!(target_os = "android")
+                    && !has_patches
+                    && oversized
+                {
+                    state
+                        .preview_cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                        .map(Arc::clone)
+                } else {
+                    None
+                };
+
+                let patched_image = if let Some(cached_img) = &cached_preview_base {
+                    Cow::Borrowed(cached_img.as_ref())
+                } else if has_patches {
+                    let composited =
                         composite_patches_on_image(&loaded_image.image, &adjustments_clone)
-                            .unwrap_or_else(|_| loaded_image.image.as_ref().clone()),
-                    )
+                            .unwrap_or_else(|_| loaded_image.image.as_ref().clone());
+                    if cfg!(target_os = "android") && oversized {
+                        Cow::Owned(downscale_f32_image(&composited, target_dim, target_dim))
+                    } else {
+                        Cow::Owned(composited)
+                    }
                 } else {
                     Cow::Borrowed(loaded_image.image.as_ref())
                 };
 
                 let blurred_image =
                     crate::lens_blur::apply_lens_blur(patched_image, &adjustments_clone);
-
-                let settings = load_settings(app_handle.clone()).unwrap_or_default();
-                let target_dim = (settings.editor_preview_resolution.unwrap_or(1920) as f32) as u32;
 
                 let downscaled = downscale_f32_image(&blurred_image, target_dim, target_dim);
 
@@ -987,6 +1027,10 @@ async fn generate_uncropped_preview(
 
         let full_hash = calculate_full_job_hash(&path, &adjustments_clone);
 
+        if state.uncropped_preview_seq.load(Ordering::SeqCst) != my_seq {
+            return Err("Superseded by newer uncropped preview request".to_string());
+        }
+
         if let Ok(processed_image) = process_and_get_dynamic_image(
             &context,
             &state,
@@ -1000,6 +1044,10 @@ async fn generate_uncropped_preview(
             },
             "generate_uncropped_preview",
         ) {
+            if state.uncropped_preview_seq.load(Ordering::SeqCst) != my_seq {
+                return Err("Superseded by newer uncropped preview request".to_string());
+            }
+
             let (width, height) = processed_image.dimensions();
             let rgb_pixels = processed_image.to_rgb8().into_vec();
 
@@ -2236,6 +2284,8 @@ pub fn run() {
             full_transformed_cache: Mutex::new(None),
             preview_cache: Mutex::new(None),
             processing_active: AtomicBool::new(false),
+            uncropped_preview_seq: AtomicUsize::new(0),
+            uncropped_preview_work_mutex: Mutex::new(()),
             decoded_image_cache: Mutex::new(DecodedImageCache::new(5)),
             thumbnail_manager: ThumbnailManager::new(),
             metadata_manager: MetadataManager::new(),

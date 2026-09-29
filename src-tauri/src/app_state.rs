@@ -245,6 +245,8 @@ pub struct AppState {
     pub full_transformed_cache: Mutex<Option<TransformedImageCache>>,
     pub preview_cache: Mutex<Option<Arc<DynamicImage>>>,
     pub processing_active: AtomicBool,
+    pub uncropped_preview_seq: AtomicUsize,
+    pub uncropped_preview_work_mutex: Mutex<()>,
     pub decoded_image_cache: Mutex<DecodedImageCache>,
     pub thumbnail_manager: Arc<ThumbnailManager>,
     pub metadata_manager: Arc<MetadataManager>,

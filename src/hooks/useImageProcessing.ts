@@ -319,7 +319,9 @@ export function useImageProcessing(
                 useEditorStore.getState().setEditor({ uncroppedAdjustedPreviewUrl: dataUrl });
               }
             })
-            .catch(console.error);
+            .catch((err) => {
+              if (!String(err).startsWith('Superseded')) console.error(err);
+            });
         },
         30,
         { leading: true, trailing: true },
@@ -335,10 +337,15 @@ export function useImageProcessing(
   );
 
   useEffect(() => {
-    if (activeView === 'editor' && activePanel === Panel.Crop && selectedImage?.isReady) {
+    if (
+      activeView === 'editor' &&
+      activePanel === Panel.Crop &&
+      selectedImage?.isReady &&
+      !isSliderDragging
+    ) {
       generateUncroppedPreview(adjustments);
     }
-  }, [activeView, adjustments, activePanel, selectedImage?.isReady, generateUncroppedPreview]);
+  }, [activeView, adjustments, activePanel, selectedImage?.isReady, isSliderDragging, generateUncroppedPreview]);
 
   const calculateTargetRes = useCallback(() => {
     const baseTargetRes = appSettings?.editorPreviewResolution || 1920;
