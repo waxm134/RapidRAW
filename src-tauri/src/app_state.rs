@@ -131,7 +131,7 @@ pub struct GpuImageCache {
     pub is_raw: u32,
     pub width: u32,
     pub height: u32,
-    pub transform_hash: u64,
+    pub staging_buffer: Vec<u8>,
 }
 
 pub struct GpuProcessorState {
