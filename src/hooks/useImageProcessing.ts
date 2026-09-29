@@ -19,6 +19,7 @@ export function useImageProcessing(
     latestRenderedJobIdRef: React.RefObject<number>;
     currentResRef: React.RefObject<number>;
   },
+  isAndroid: boolean,
 ) {
   const { previewJobIdRef, latestRenderedJobIdRef, currentResRef } = renderRefs;
 
@@ -44,6 +45,9 @@ export function useImageProcessing(
   const inFlightCountRef = useRef(0);
   const lastAnalyticsTimeRef = useRef<number>(0);
   const pendingApplyRef = useRef<{ adjustments: Adjustments; targetRes?: number } | null>(null);
+  const lastFlushTimeRef = useRef(0);
+  const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hiFiZoomMaxResRef = useRef<number>(0);
   const dragIdleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeWaveformChannelRef = useRef(activeWaveformChannel);
   activeWaveformChannelRef.current = activeWaveformChannel;
@@ -278,6 +282,21 @@ export function useImageProcessing(
     if (inFlightCountRef.current >= 3) return;
     if (!pendingApplyRef.current) return;
 
+    if (isAndroid) {
+      const now = Date.now();
+      const elapsed = now - lastFlushTimeRef.current;
+      if (elapsed < 33) {
+        if (!flushTimerRef.current) {
+          flushTimerRef.current = setTimeout(() => {
+            flushTimerRef.current = null;
+            flushPipeline();
+          }, 200 - elapsed);
+        }
+        return;
+      }
+      lastFlushTimeRef.current = now;
+    }
+
     const { adjustments, targetRes } = pendingApplyRef.current;
     pendingApplyRef.current = null;
 
@@ -289,7 +308,7 @@ export function useImageProcessing(
         requestAnimationFrame(() => flushPipeline());
       }
     });
-  }, [executeApplyAdjustments]);
+  }, [executeApplyAdjustments, isAndroid]);
 
   const applyAdjustments = useCallback(
     (currentAdjustments: Adjustments, dragging: boolean = false, targetRes?: number) => {
@@ -387,14 +406,16 @@ export function useImageProcessing(
   const requestHiFiZoom = useMemo(
     () =>
       debounce((targetRes: number) => {
-        if (targetRes > currentResRef.current) {
-          currentResRef.current = targetRes;
+        const bestRes = isAndroid ? hiFiZoomMaxResRef.current : targetRes;
+        if (isAndroid) hiFiZoomMaxResRef.current = 0;
+        if (bestRes > currentResRef.current) {
+          currentResRef.current = bestRes;
           const { adjustments, previewOverride } = useEditorStore.getState();
           const renderAdjustments = previewOverride ?? adjustments;
-          applyAdjustments(renderAdjustments, false, targetRes);
+          applyAdjustments(renderAdjustments, false, bestRes);
         }
       }, 50),
-    [applyAdjustments, currentResRef],
+    [applyAdjustments, currentResRef, isAndroid],
   );
 
   useEffect(() => {
@@ -407,6 +428,9 @@ export function useImageProcessing(
       const finalRes = Math.round(baseRes);
 
       if (finalRes > currentResRef.current) {
+        if (isAndroid) {
+          hiFiZoomMaxResRef.current = Math.max(hiFiZoomMaxResRef.current, finalRes);
+        }
         requestHiFiZoom(finalRes);
       } else if (finalRes < currentResRef.current * 0.7) {
         // Zoomed out significantly — re-render at lower res to free cached high-res preview memory
