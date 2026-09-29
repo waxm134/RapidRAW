@@ -891,6 +891,10 @@ pub async fn load_image(
                 .unwrap_or_else(|e| e.into_inner()) = None;
         }
         *state
+            .gpu_processor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        *state
             .gpu_image_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
