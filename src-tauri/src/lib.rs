@@ -1,7 +1,7 @@
-#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
+#[cfg(not(any(target_os = "windows", target_arch = "aarch64", target_os = "android")))]
 use mimalloc::MiMalloc;
 
-#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
+#[cfg(not(any(target_os = "windows", target_arch = "aarch64", target_os = "android")))]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
