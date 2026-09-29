@@ -126,7 +126,7 @@ pub struct GpuImageCache {
     pub texture_view: TextureView,
     pub width: u32,
     pub height: u32,
-    pub transform_hash: u64,
+    pub staging_buffer: Vec<u8>,
 }
 
 pub struct GpuProcessorState {

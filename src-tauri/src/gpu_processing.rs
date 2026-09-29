@@ -1814,7 +1814,7 @@ fn process_and_get_dynamic_image_inner(
     context: &GpuContext,
     state: &tauri::State<AppState>,
     base_image: &DynamicImage,
-    transform_hash: u64,
+    _transform_hash: u64,
     request: RenderRequest,
     caller_id: &str,
     output_precision: RenderOutputPrecision,
@@ -1894,27 +1894,59 @@ fn process_and_get_dynamic_image_inner(
             guard
         }
     };
-    let mut needs_new_cache = false;
 
-    if let Some(cache) = &*cache_lock {
-        if cache.transform_hash != transform_hash || cache.width != width || cache.height != height
-        {
-            needs_new_cache = true;
-        }
-    } else {
-        needs_new_cache = true;
-    }
-
-    if needs_new_cache {
-        let old_cache = cache_lock.take();
-        drop(old_cache);
-
+    // Reuse the texture object whenever dimensions allow; only reallocate on
+    // resize so zooming/adjustments do not churn GPU memory
+    if let Some(cache) = &*cache_lock
+        && (cache.width != width || cache.height != height)
+    {
+        *cache_lock = None;
         let _ = context.device.poll(wgpu::PollType::Wait {
             submission_index: None,
             timeout: Some(std::time::Duration::from_millis(500)),
         });
+    }
 
-        let img_rgba_f16 = to_rgba_f16(base_image);
+    let img_rgba_f16 = to_rgba_f16(base_image);
+
+    if let Some(cache) = cache_lock.as_mut() {
+        let src_bytes: &[u8] = bytemuck::cast_slice(&img_rgba_f16);
+        let row_bytes = width as usize * 8;
+        let bytes_per_row = ((row_bytes + 255) & !255) as u32;
+        let data: &[u8] = if bytes_per_row as usize == row_bytes {
+            src_bytes
+        } else {
+            let needed = bytes_per_row as usize * height as usize;
+            cache.staging_buffer.resize(needed, 0);
+            for y in 0..height as usize {
+                let src_start = y * row_bytes;
+                let dst_start = y * bytes_per_row as usize;
+                cache.staging_buffer[dst_start..dst_start + row_bytes]
+                    .copy_from_slice(&src_bytes[src_start..src_start + row_bytes]);
+            }
+            &cache.staging_buffer
+        };
+
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &cache.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: None,
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+    } else {
         let texture_size = wgpu::Extent3d {
             width,
             height,
@@ -1942,7 +1974,7 @@ fn process_and_get_dynamic_image_inner(
             texture_view,
             width,
             height,
-            transform_hash,
+            staging_buffer: Vec::new(),
         });
     }
 
