@@ -6,14 +6,20 @@ interface Props {
   previewJobIdRef: React.RefObject<number>;
   latestRenderedJobIdRef: React.RefObject<number>;
   currentResRef: React.RefObject<number>;
+  isAndroid: boolean;
 }
 
 export default function ImageProcessingManager(props: Props) {
-  useImageProcessing(props.transformWrapperRef, props.prevAdjustmentsRef, {
-    previewJobIdRef: props.previewJobIdRef,
-    latestRenderedJobIdRef: props.latestRenderedJobIdRef,
-    currentResRef: props.currentResRef,
-  });
+  useImageProcessing(
+    props.transformWrapperRef,
+    props.prevAdjustmentsRef,
+    {
+      previewJobIdRef: props.previewJobIdRef,
+      latestRenderedJobIdRef: props.latestRenderedJobIdRef,
+      currentResRef: props.currentResRef,
+    },
+    props.isAndroid,
+  );
 
   return null;
 }

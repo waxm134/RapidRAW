@@ -858,6 +858,7 @@ function App() {
         previewJobIdRef={previewJobIdRef}
         latestRenderedJobIdRef={latestRenderedJobIdRef}
         currentResRef={currentResRef}
+        isAndroid={isAndroid}
       />
       <ImageLoaderManager cachedEditStateRef={cachedEditStateRef} />
       <div
