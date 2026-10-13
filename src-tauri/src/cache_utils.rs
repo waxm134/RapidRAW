@@ -66,9 +66,11 @@ fn hash_ai_patches(adjustments: &serde_json::Value, hasher: &mut DefaultHasher) 
                 data_len.hash(hasher);
             }
 
-            if let Some(sub_masks_val) = patch.get("subMasks") {
-                sub_masks_val.to_string().hash(hasher);
-            }
+            let sub_masks_empty = patch
+                .get("subMasks")
+                .and_then(|v| v.as_array())
+                .is_none_or(|a| a.is_empty());
+            sub_masks_empty.hash(hasher);
 
             let invert = patch
                 .get("invert")
@@ -476,6 +478,9 @@ pub fn clear_image_caches(state: tauri::State<AppState>) {
     }
     if let Ok(mut gpu_cache) = state.gpu_image_cache.lock() {
         *gpu_cache = None;
+    }
+    if let Ok(mut gpu_proc) = state.gpu_processor.lock() {
+        *gpu_proc = None;
     }
     if let Ok(mut preview_cache) = state.cached_preview.lock() {
         *preview_cache = None;
